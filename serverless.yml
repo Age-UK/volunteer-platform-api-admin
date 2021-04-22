@@ -1,0 +1,578 @@
+service: auk-volunteer-platform
+package:
+  individually: true
+  excludeDevDependencies: true
+  exclude:
+   - '!.serverless-offline/**'
+provider:
+  name: aws
+  runtime: nodejs12.x
+  stage: ${opt:stage, 'dev'} # stages defined in custom below
+  region: eu-west-2
+  memorySize: 1024
+  iamRoleStatements:
+    # For deploying in VPC
+    - Effect: Allow
+      Action:
+        - ec2:CreateNetworkInterface
+        - ec2:DescribeNetworkInterfaces
+        - ec2:DeleteNetworkInterface
+      Resource: "*"
+    - Effect: "Allow"
+      Action:
+        - "sns:Publish"
+      Resource:
+        - "Ref" : "VolPlatformSnsEventsTopic"
+  environment:
+    databaseName: ${self:custom.rds.db}
+    databaseUser: ${self:custom.rds.masteruser}
+    databasePassword: ${self:custom.rds.masterpwd}
+    databaseHost: ${self:custom.rds.host}
+    databasePort: ${self:custom.rds.port}
+    databaseSSL: ${self:custom.rds.ssl}
+    tokenExpiryHours: ${env:TOKEN_EXPIRY_HOURS}
+    mandrillApiKey: ${env:MANDRILL_API_KEY}
+    snsTopic: ${self:custom.sns.topic}
+    feDomain: ${env:FE_PROTOCOL}
+    systemUserPassword: ${env:SYSTEM_USER_PASSWORD}
+    jwtSecret: ${env:JWT_SECRET}
+    DEFAULT_LAYER_ROOT: ${env.DEFAULT_LAYER_ROOT, '/opt'}
+
+# app: aukvol
+# tenant: aukvol
+
+plugins:
+  - serverless-offline
+  - serverless-plugin-typescript-express # configuration helper for typescript on serverless
+  - serverless-dotenv-plugin
+  - serverless-latest-layer-version
+
+frameworkVersion: '2'
+
+custom:
+  # Allowed stages for the stage manager
+  stages:
+    - local
+    - dev
+    - stage
+    - production
+  
+  serverless-offline:
+    noPrependStageInUrl: true
+    useDocker: true
+
+  # Namespace and other globals
+  namespace: ${self:service}-${self:provider.stage}
+
+  # Public domain alias for cloudfront
+  publicDomain: ${env:FE_DOMAIN}
+  aliasCertificateArn: ${env:ALIAS_CERTIFICATE_ARN}
+  VOLPLATFORM_LAYER_ARN: ${env:VOLPLATFORM_LAYER_ARN}
+  VOLNODEJS_LAYER_ARN: ${env:VOLNODEJS_LAYER_ARN}
+  S3_BUCKET_NAME: ${env:S3_BUCKET_NAME}
+
+  # RDS
+  rds:
+    # Default is 'Delete'. Override with 'Retain' not to drop datastores when removing the stack
+    # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-attribute-deletionpolicy.html
+    deletionPolicy: ${env:RDS_DELETION_POLICY, 'Delete'}
+    db: ${env:DATABASE_NAME}
+    masteruser: ${env:DATABASE_USER}
+    masterpwd: ${env:DATABASE_PASSWORD}
+    instanceClass: ${env:RDS_INSTANCE_CLASS, 'db.t2.small'}
+    port: ${env:DATABASE_PORT}
+    ssl: ${env:DATABASE_SSL, 'RDS'}
+    hosts:
+      local: ${env:DATABASE_HOST, 'localhost'}
+      dev:
+        !GetAtt VolPlatformRDSCluster.Endpoint.Address
+      stage:
+        !GetAtt VolPlatformRDSCluster.Endpoint.Address
+      production:
+        !GetAtt VolPlatformRDSCluster.Endpoint.Address
+    host: ${self:custom.rds.hosts.${self:provider.stage}}
+
+  # SNS
+  sns:
+    topics:
+      local: ${env:SNS_TOPIC, ''}
+      dev:
+        Ref: VolPlatformSnsEventsTopic
+      stage:
+        Ref: VolPlatformSnsEventsTopic
+      production:
+        Ref: VolPlatformSnsEventsTopic
+    topic: ${self:custom.sns.topics.${self:provider.stage}}
+
+  s3:
+    publicstaticassetsbucket: ${self:service}-${self:provider.stage}-public-static-assets
+
+functions:
+  app:
+    handler: src/server.handler
+    events:
+      - sns:
+          arn:
+            Ref: VolPlatformSnsEventsTopic
+          topicName: ${self:custom.namespace}-events-topic
+      - http: 
+          path: /
+          method: ANY
+          cors:
+            origins:
+              - '*'
+            headers:
+              - Content-Type
+              - X-Amz-Date
+              - Authorization
+              - X-Api-Key
+              - X-Amz-Security-Token
+              - access-control-allow-origin
+              - pragma
+              - cache-control
+      - http: 
+          path: /{proxy+}
+          method: ANY
+          cors:
+            origins:
+              - '*'
+            headers:
+              - Content-Type
+              - X-Amz-Date
+              - Authorization
+              - X-Api-Key
+              - X-Amz-Security-Token
+              - access-control-allow-origin
+              - pragma
+              - cache-control
+    layers:
+      - ${self:custom.VOLNODEJS_LAYER_ARN}
+      - ${self:custom.VOLPLATFORM_LAYER_ARN}
+      # - {Ref: VolnodejsLambdaLayer}
+      # - {Ref: VolplatformLambdaLayer}
+    vpc:
+      securityGroupIds:
+        - !GetAtt VolPlatformSecurityGroup.GroupId
+      subnetIds:
+        - Ref: VolPlatformPrivateSubnetA
+        - Ref: VolPlatformPrivateSubnetB
+layers:
+  volplatform:
+    path: layers
+    name: volplatform
+    description: Code library for Volunteer Platform
+    compatibleRuntimes:
+      - nodejs12.x
+      - nodejs14.x
+    licenseInfo: GPL-2.0-or-later
+
+# CloudFormation resource templates here
+resources:
+  Resources:
+    # VPC
+    VolPlatformVPC:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: "10.0.0.0/16"
+        EnableDnsHostnames: false
+        Tags:
+          - Key: Name
+            Value: "${self:custom.namespace}"
+
+    # VPC networking
+
+    # 2 Private subnets
+    VolPlatformPrivateSubnetA:
+      DependsOn: VolPlatformVPC
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId:
+          Ref: VolPlatformVPC
+        AvailabilityZone: ${self:provider.region}a
+        CidrBlock: "10.0.10.0/24"
+        Tags:
+          - Key: Name
+            Value: "${self:custom.namespace} Private Subnet ${self:provider.region}a"
+
+    VolPlatformPrivateSubnetB:
+      DependsOn: VolPlatformVPC
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId:
+          Ref: VolPlatformVPC
+        AvailabilityZone: ${self:provider.region}b
+        CidrBlock: "10.0.11.0/24"
+        Tags:
+          - Key: Name
+            Value: "${self:custom.namespace} Private Subnet ${self:provider.region}a"
+
+    # 1 Public subnet
+    VolPlatformPublicSubnet:
+      DependsOn: VolPlatformVPC
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId:
+          Ref: VolPlatformVPC
+        AvailabilityZone: ${self:provider.region}a
+        CidrBlock: "10.0.0.0/24"
+        Tags:
+          - Key: Name
+            Value: "${self:custom.namespace} Public Subnet ${self:provider.region}a"
+
+    # Required to give internet access to the lambda function
+
+    # Nat gateway
+    VolPlatformNATIP:
+      DependsOn: VolPlatformVPC
+      Type: AWS::EC2::EIP
+      Properties:
+        Domain: vpc
+
+    VolPlatformNatGateway:
+      DependsOn: VolPlatformPublicSubnet
+      Type: AWS::EC2::NatGateway
+      Properties:
+        SubnetId:
+          Ref: VolPlatformPublicSubnet
+        AllocationId:
+          !GetAtt VolPlatformNATIP.AllocationId
+        Tags:
+          - Key: Name
+            Value: "${self:custom.namespace} NAT Gateway - Public Subnet"
+
+    # Private route table & default route
+    VolPlatformPrivateRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId:
+          Ref: VolPlatformVPC
+        Tags:
+          - Key: Name
+            Value: "${self:custom.namespace} Private Route Table (Lambda)"
+
+    VolPlatformDefaultPrivateRoute:
+      Type: AWS::EC2::Route
+      Properties:
+        RouteTableId:
+          Ref: VolPlatformPrivateRouteTable
+        DestinationCidrBlock: "0.0.0.0/0"
+        NatGatewayId:
+          Ref: VolPlatformNatGateway
+          
+    VolPlatformPrivateARouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        RouteTableId:
+          Ref: VolPlatformPrivateRouteTable
+        SubnetId:
+          Ref: VolPlatformPrivateSubnetA
+
+    VolPlatformPrivateBRouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        RouteTableId:
+          Ref: VolPlatformPrivateRouteTable
+        SubnetId:
+          Ref: VolPlatformPrivateSubnetB
+
+    # Internet gateway for the VPC
+    VolPlatformIgw:
+      Type: AWS::EC2::InternetGateway
+      Properties:
+        Tags:
+          - Key: Name
+            Value: "${self:custom.namespace} IGW"
+
+    VolPlatformIgwAttachment:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+        VpcId:
+          Ref: VolPlatformVPC
+        InternetGatewayId:
+          Ref: VolPlatformIgw    
+
+    # Route table and route for the public subnet
+    VolPlatformPublicRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId:
+          Ref: VolPlatformVPC
+        Tags:
+          - Key: Name
+            Value: "${self:custom.namespace} Public Route Table (IGW)"
+
+    VolPlatformDefaultPublicRoute:
+      DependsOn: VolPlatformIgw
+      Type: AWS::EC2::Route
+      Properties:
+        RouteTableId:
+          Ref: VolPlatformPublicRouteTable
+        DestinationCidrBlock: "0.0.0.0/0"
+        GatewayId:
+          Ref: VolPlatformIgw
+
+    VolPlatformPublicRouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        RouteTableId:
+          Ref: VolPlatformPublicRouteTable
+        SubnetId:
+          Ref: VolPlatformPublicSubnet
+
+    # Security groups
+    VolPlatformSecurityGroup:
+      DependsOn: VolPlatformVPC
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: SecurityGroup for ${self:custom.namespace} public bastion
+        VpcId:
+          Ref: VolPlatformVPC
+        # SecurityGroupIngress:
+        #   - IpProtocol: tcp
+        #     FromPort: '22'
+        #     ToPort: '22'
+        #     CidrIp: '0.0.0.0/0'
+        #     Description: Allow all incoming ssh traffic
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            FromPort: -1
+            ToPort: -1
+            CidrIp: '0.0.0.0/0'
+            Description: Allow all outgoing traffic
+        Tags:
+          - Key: Name
+            Value: "${self:custom.namespace} Public Bastion security group"
+
+    # RDS
+    # Set up RDS aurora cluster and the relevant security groups to allow the lambda function access
+    # Bastion host for querying can be set up manually
+    VolPlatformRDSSecurityGroup:
+      DependsOn:
+        - VolPlatformVPC
+        - VolPlatformSecurityGroup
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Ingress for Aurora (MySQL) Cluster - ${self:custom.namespace}
+        VpcId:
+          Ref: VolPlatformVPC
+        SecurityGroupIngress:
+        - IpProtocol: tcp # MySQL (Aurora)
+          FromPort: '3306'
+          ToPort: '3306'
+          SourceSecurityGroupId:
+            Ref: VolPlatformSecurityGroup
+          Description: Allow access to DB from the public security group
+        Tags:
+          - Key: Name
+            Value: "${self:custom.namespace} RDS Security group"
+
+    VolPlatformRDSSubnetGroup:
+      Type: AWS::RDS::DBSubnetGroup
+      Properties:
+        DBSubnetGroupDescription: RDS Subnet Group - ${self:custom.namespace}
+        SubnetIds:
+        - Ref: VolPlatformPrivateSubnetA
+        - Ref: VolPlatformPrivateSubnetB
+          
+    VolPlatformRDSCluster:
+      DependsOn: VolPlatformRDSSecurityGroup
+      Type: AWS::RDS::DBCluster
+      DeletionPolicy: ${self:custom.rds.deletionPolicy}
+      Properties:
+        Engine: aurora-mysql
+        EngineMode: provisioned
+        Port: 3306
+        DatabaseName: ${self:custom.rds.db}
+        MasterUsername: ${self:custom.rds.masteruser}
+        MasterUserPassword: ${self:custom.rds.masterpwd}
+        VpcSecurityGroupIds:
+          - Ref: VolPlatformRDSSecurityGroup
+        DBSubnetGroupName:
+          Ref: VolPlatformRDSSubnetGroup
+        Tags:
+          - Key: Name
+            Value: "${self:custom.namespace} API db"
+
+    VolPlatformRDSInstanceParameterGroup:
+      Type: AWS::RDS::DBParameterGroup
+      Properties:
+        Description: RDS Instance parameters
+        Family: aurora-mysql5.7
+        Parameters:
+          wait_timeout: 1
+        Tags:
+          - Key: Name
+            Value: "${self:custom.namespace} API db instance parameter group"
+      
+    VolPlatformRDSPrimaryInstance:
+      DependsOn:
+        - VolPlatformRDSCluster
+        - VolPlatformRDSInstanceParameterGroup
+      Type: AWS::RDS::DBInstance
+      Properties:
+        Engine: 'aurora-mysql'
+        EngineVersion: '5.7.mysql_aurora.2.07.2'
+        DBClusterIdentifier: 
+          Ref: VolPlatformRDSCluster
+        DBInstanceClass: ${self:custom.rds.instanceClass}
+        DBSubnetGroupName:
+          Ref: VolPlatformRDSSubnetGroup
+        DBParameterGroupName:
+          Ref: VolPlatformRDSInstanceParameterGroup
+        Tags:
+          - Key: Name
+            Value: "${self:custom.namespace} API db - Primary"
+
+    # SNS
+    VolPlatformSnsEventsTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        DisplayName: ${self:custom.namespace} Events Topic
+        TopicName: ${self:custom.namespace}-events-topic
+
+    # S3
+
+    # Static assets buckets and config for public
+    VolPlatformPublicStaticAssetsS3Bucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.S3_BUCKET_NAME}
+        AccessControl: PublicRead
+        WebsiteConfiguration:
+          IndexDocument: index.html
+
+    # Cloudfront distributions
+    VolPlatformCloudfrontOriginAccessIdentity:
+      Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+      Properties:
+        CloudFrontOriginAccessIdentityConfig:
+          Comment: ${self:custom.namespace} Origin Access Identity
+
+    # Cloudfront distributions
+    VolPlatformPublicCloudfrontDistribution:
+      DependsOn:
+        - VolPlatformCloudfrontOriginAccessIdentity
+        - VolPlatformPublicStaticAssetsS3Bucket
+      Type: AWS::CloudFront::Distribution
+      Properties:
+        DistributionConfig:
+          Origins:
+            - DomainName:
+                !GetAtt VolPlatformPublicStaticAssetsS3Bucket.DomainName
+              Id: Public
+              S3OriginConfig:
+                OriginAccessIdentity:
+                  "Fn::Join" : ["", [ "origin-access-identity/cloudfront/", { "Ref" : "VolPlatformCloudfrontOriginAccessIdentity" } ] ]
+              # CustomOriginConfig:
+              #   HTTPPort: 80
+              #   HTTPSPort: 443
+              #   OriginProtocolPolicy: https-only
+              #   OriginReadTimeout: 10
+          Enabled: true
+          IPV6Enabled: true
+          # Aliases:
+          #   - ${self:custom.publicDomain}
+          ViewerCertificate:
+            CloudFrontDefaultCertificate: true
+            # AcmCertificateArn: ${self:custom.aliasCertificateArn}
+            # MinimumProtocolVersion: TLSv1.1_2016
+            # SslSupportMethod: sni-only
+          # Custom error response allows us to access url's directly in our SPA
+          CustomErrorResponses:
+            - ErrorCode: 404
+              ResponseCode: 200
+              ResponsePagePath: /index.html
+          DefaultCacheBehavior:
+            Compress: true
+            DefaultTTL: 0
+            TargetOriginId: Public
+            ForwardedValues:
+              QueryString: true
+            ViewerProtocolPolicy: redirect-to-https
+          DefaultRootObject: index.html
+
+  # Cloudformation outputs
+  Outputs:
+    VolPlatformVPCId:
+      Description: The ID of the VolPlatform VPC
+      Value:
+        Ref: VolPlatformVPC
+      Export:
+        Name: VolPlatformVPCId
+
+    VolPlatformPublicSubnetId:
+      Description: The ID of the VolPlatform public subnet
+      Value:
+        Ref: VolPlatformPublicSubnet
+      Export:
+        Name: VolPlatformPublicSubnetId
+
+    VolPlatformSecurityGroupId:
+      Description: The ID of the VolPlatform public security group
+      Value:
+        Ref: VolPlatformSecurityGroup
+      Export:
+        Name: VolPlatformSecurityGroupId
+
+    VolPlatformRDSPrimaryInstance:
+      Description: The endpoint for the DB instance
+      Value:
+        !GetAtt VolPlatformRDSCluster.Endpoint.Address
+      Export:
+        Name: VolPlatformRDSPrimaryInstance
+
+    # VolPlatformApiGatewayRestApiEndpoint:
+    #   Description: The API Gateway url
+    #   Value:
+    #     "Fn::Join" : [ ".", [ { "Ref" : "VolPlatformApiGatewayRestApiEndpoint" }, "execute-api.${self:provider.region}.amazonaws.com/${self:provider.stage}" ] ]
+    #   Export:
+    #     Name: VolPlatformApiGatewayRestApiEndpoint
+
+    # S3DeploymentUserAccessKeyId:
+    #   Description: Access Key Id for the IAM User to use for static asset deployment
+    #   Value:
+    #     Ref: S3DeploymentUserAccessKey
+    #   Export:
+    #     Name: S3DeploymentUserAccessKeyId
+
+    # S3DeploymentUserSecretAccessKey:
+    #   Description: Secret Access Key for the IAM User to use for static asset deployment
+    #   Value:
+    #     !GetAtt S3DeploymentUserAccessKey.SecretAccessKey
+    #   Export:
+    #     Name: S3DeploymentUserSecretAccessKey
+
+    VolPlatformCloudfrontOriginIdentityUserId:
+      Description: The canonical user id for the Cloudfront Origin Identity
+      Value:
+        !GetAtt VolPlatformCloudfrontOriginAccessIdentity.S3CanonicalUserId
+      Export:
+        Name: VolPlatformCloudfrontOriginIdentityUserId
+
+    VolPlatformCloudfrontOriginIdentityId:
+      Description: The id of the Cloudfront Origin Identity
+      Value:
+        Ref: VolPlatformCloudfrontOriginAccessIdentity
+      Export:
+        Name: VolPlatformCloudfrontOriginIdentityId
+
+    VolPlatformPublicCloudfrontUrl:
+      Description: The public cloudfront URL
+      Value:
+        !GetAtt VolPlatformPublicCloudfrontDistribution.DomainName
+      Export:
+        Name: VolPlatformPublicCloudfrontUrl
+
+    VolPlatformPublicCloudfrontDistributionId:
+      Description: The id of the Public Cloudfront Origin
+      Value:
+        Ref: VolPlatformPublicCloudfrontDistribution
+      Export:
+        Name: VolPlatformPublicCloudfrontDistributionId
+
+    VolPlatformSnsEventTopicArn:
+      Description: The ARN for the sns event topic
+      Value:
+        Ref: VolPlatformSnsEventsTopic
+      Export:
+        Name: VolPlatformSnsEventTopicArn
