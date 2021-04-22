@@ -177,4 +177,4 @@ The volunteer platform incorporates two front-end applications
 These can be hosted via the hosting platform of your choice.  AWS S3 static hosting is recommended.
 
 ## License
-[MIT](https://choosealicense.com/licenses/mit/)
+[GNU](https://choosealicense.com/licenses/gpl-3.0/)
